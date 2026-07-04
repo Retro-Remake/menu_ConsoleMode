@@ -21,7 +21,7 @@ module osd
 	output reg    osd_status
 );
 
-parameter  OSD_COLOR    =  3'd4;
+parameter  OSD_COLOR    =  3'd1; // ConsoleMode: blue OSD tint (bit0=B)
 
 localparam OSD_WIDTH    = 12'd256;
 localparam OSD_HEIGHT   = 12'd64;
@@ -265,6 +265,7 @@ always @(posedge clk_video) begin
 	reg hs1,hs2,hs3;
 
 	nrdout1 <= din;
+	// ConsoleMode: transparent OSD, video bleeds through dimmed
 	ordout1 <= {{osd_pixel, osd_pixel, OSD_COLOR[2], din[23:19]},// 23:16
 	            {osd_pixel, osd_pixel, OSD_COLOR[1], din[15:11]},// 15:8
 	            {osd_pixel, osd_pixel, OSD_COLOR[0], din[7:3]}}; //  7:0

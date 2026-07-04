@@ -24,6 +24,8 @@ module native_video_reader
 	input  wire        new_frame,
 	input  wire        new_line,
 	input  wire  [8:0] vcount,
+	input  wire  [2:0] mode,
+	input  wire        field,
 
 	output reg   [7:0] r_out,
 	output reg   [7:0] g_out,
@@ -36,13 +38,30 @@ assign ddr_din = 64'd0;
 assign ddr_be  = 8'hFF;
 assign ddr_we  = 1'b0;
 
-localparam [28:0] CTRL_ADDR   = 29'h07400000;
-localparam [28:0] BUF0_ADDR   = 29'h07400020;
-localparam [28:0] BUF1_ADDR   = 29'h07409620;
-localparam [7:0]  LINE_BURST  = 8'd160;
-localparam [28:0] LINE_STRIDE = 29'd160;
-localparam [8:0]  V_ACTIVE    = 9'd240;
+localparam [2:0] MODE_NTSC    = 3'd0;
+localparam [2:0] MODE_480I    = 3'd1;   // 640x480
+localparam [2:0] MODE_PAL     = 3'd2;
+localparam [2:0] MODE_480I_D1 = 3'd3;   // 720x480 (D1)
+localparam [2:0] MODE_576I    = 3'd4;   // 720x576i (PAL interlaced)
+
+localparam [28:0] CTRL_ADDR   = 29'h07400000;  // 0x3A000000
+localparam [28:0] BUF0_ADDR   = 29'h07400020;  // 0x3A000100 (fixed)
 localparam [19:0] TIMEOUT_MAX = 20'hF_FFFF;
+
+// Per-mode geometry.
+reg [8:0] line_words;      // 64-bit words per source line
+reg [8:0] scan_lines;      // active display lines fetched per frame/field
+reg       scan_interlaced; // 480i: source line = display_line*2 + field
+reg       two_bursts;
+always @* begin
+	case(mode)
+	MODE_480I:    begin line_words = 9'd320; scan_lines = 9'd240; scan_interlaced = 1'b1; two_bursts = 1'b1; end
+	MODE_480I_D1: begin line_words = 9'd360; scan_lines = 9'd240; scan_interlaced = 1'b1; two_bursts = 1'b1; end
+	MODE_PAL:     begin line_words = 9'd176; scan_lines = 9'd288; scan_interlaced = 1'b0; two_bursts = 1'b0; end
+	MODE_576I:    begin line_words = 9'd360; scan_lines = 9'd288; scan_interlaced = 1'b1; two_bursts = 1'b1; end
+	default:      begin line_words = 9'd160; scan_lines = 9'd240; scan_interlaced = 1'b0; two_bursts = 1'b0; end
+	endcase
+end
 
 reg [1:0] enable_sync;
 always @(posedge ddr_clk) begin
@@ -71,6 +90,13 @@ always @(posedge ddr_clk) begin
 		else vblank_sync <= {vblank_sync[0], vblank};
 end
 wire vblank_ddr = vblank_sync[1];
+
+reg [1:0] field_sync;
+always @(posedge ddr_clk) begin
+	if(reset) field_sync <= 2'b0;
+		else field_sync <= {field_sync[0], field};
+end
+wire field_ddr = field_sync[1];
 
 reg [1:0] reset_vid_sync;
 always @(posedge clk_vid or posedge reset) begin
@@ -105,6 +131,8 @@ reg  [8:0]  cur_line;
 reg  [7:0]  beat_count;
 reg         first_frame_loaded;
 reg         preloading;
+reg         fetch_field;       // field latched at fetch start (consistent per field)
+reg         burst_idx;         // 480i: 0 = first 180-word burst, 1 = second
 reg  [19:0] timeout_cnt;
 reg         fifo_wr;
 reg  [63:0] fifo_wr_data;
@@ -113,6 +141,17 @@ wire        fifo_full;
 reg [3:0] fifo_aclr_cnt;
 wire fifo_aclr_ddr_active = (fifo_aclr_cnt != 4'd0);
 wire fifo_aclr = reset | fifo_aclr_ddr_active;
+
+// buf1 sits one full frame (all source lines) after buf0
+wire [9:0]  total_lines = scan_interlaced ? {scan_lines, 1'b0} : {1'b0, scan_lines};
+wire [28:0] buf1_addr   = BUF0_ADDR + (line_words * total_lines);
+
+// 480i/576i lines exceed the 255 burstcnt max so they fetch as two half-line bursts
+wire [8:0]  half_words = {1'b0, line_words[8:1]};   // line_words/2 (480i/576i: 180)
+// 10-bit: 576i src_line reaches 575
+wire [9:0]  src_line  = scan_interlaced ? ({cur_line, 1'b0} + {9'd0, fetch_field}) : {1'b0, cur_line};
+wire [28:0] line_base = buf_base_addr + (src_line * line_words) + (burst_idx ? {20'd0, half_words} : 29'd0);
+wire [7:0]  burst_len = two_bursts ? half_words[7:0] : line_words[7:0];
 
 always @(posedge ddr_clk) begin
 	if(reset) begin
@@ -128,6 +167,8 @@ always @(posedge ddr_clk) begin
 		first_frame_loaded <= 1'b0;
 		frame_ready_reg    <= 1'b0;
 		preloading         <= 1'b0;
+		fetch_field        <= 1'b0;
+		burst_idx          <= 1'b0;
 		timeout_cnt        <= 20'd0;
 		fifo_wr            <= 1'b0;
 		fifo_wr_data       <= 64'd0;
@@ -171,10 +212,13 @@ always @(posedge ddr_clk) begin
 			end
 
 			ST_CHECK_CTRL: begin
+				// unchanged counter still re-fetches, that's how 480i shows the other field
 				if(ctrl_word[31:2] != prev_frame_counter) begin
 					prev_frame_counter <= ctrl_word[31:2];
-					buf_base_addr      <= ctrl_word[0] ? BUF1_ADDR : BUF0_ADDR;
+					buf_base_addr      <= ctrl_word[0] ? buf1_addr : BUF0_ADDR;
 					cur_line           <= 9'd0;
+					burst_idx          <= 1'b0;
+					fetch_field        <= field_ddr;
 					preloading         <= 1'b1;
 					fifo_aclr_cnt      <= 4'd8;
 					if(first_frame_loaded) frame_ready_reg <= 1'b1;
@@ -182,6 +226,8 @@ always @(posedge ddr_clk) begin
 				end
 				else if(first_frame_loaded) begin
 					cur_line      <= 9'd0;
+					burst_idx     <= 1'b0;
+					fetch_field   <= field_ddr;
 					preloading    <= 1'b1;
 					fifo_aclr_cnt <= 4'd8;
 					state         <= ST_READ_LINE;
@@ -193,8 +239,8 @@ always @(posedge ddr_clk) begin
 
 			ST_READ_LINE: begin
 				if(!ddr_busy && !fifo_aclr_ddr_active) begin
-					ddr_addr     <= buf_base_addr + (cur_line * LINE_STRIDE);
-					ddr_burstcnt <= LINE_BURST;
+					ddr_addr     <= line_base;
+					ddr_burstcnt <= burst_len;
 					ddr_rd       <= 1'b1;
 					beat_count   <= 8'd0;
 					timeout_cnt  <= 20'd0;
@@ -203,14 +249,23 @@ always @(posedge ddr_clk) begin
 			end
 
 			ST_WAIT_LINE: begin
-				if(beat_count == LINE_BURST) state <= ST_LINE_DONE;
+				if(beat_count == burst_len) begin
+					if(two_bursts && !burst_idx) begin
+						burst_idx <= 1'b1;       // fetch the second half of the 480i line
+						state     <= ST_READ_LINE;
+					end
+					else begin
+						burst_idx <= 1'b0;
+						state     <= ST_LINE_DONE;
+					end
+				end
 				else if(timeout_cnt == TIMEOUT_MAX) state <= ST_IDLE;
 				else if(!ddr_dout_ready) timeout_cnt <= timeout_cnt + 20'd1;
 			end
 
 			ST_LINE_DONE: begin
 				cur_line <= cur_line + 9'd1;
-				if(cur_line == V_ACTIVE - 9'd1) begin
+				if(cur_line == scan_lines - 9'd1) begin
 					first_frame_loaded <= 1'b1;
 					frame_ready_reg    <= 1'b1;
 					preloading         <= 1'b0;
@@ -226,7 +281,7 @@ always @(posedge ddr_clk) begin
 			end
 
 			ST_WAIT_DISPLAY: begin
-				if(cur_line < V_ACTIVE && new_line_ddr && !vblank_ddr) state <= ST_READ_LINE;
+				if(cur_line < scan_lines && new_line_ddr && !vblank_ddr) state <= ST_READ_LINE;
 			end
 
 			default: state <= ST_IDLE;
@@ -238,13 +293,14 @@ wire [63:0] fifo_rd_data;
 wire        fifo_empty;
 reg         fifo_rd;
 
+// 1024 deep: must hold two preloaded 360-word lines
 dcfifo #(
 	.intended_device_family ("Cyclone V"),
-	.lpm_numwords           (512),
+	.lpm_numwords           (1024),
 	.lpm_showahead          ("ON"),
 	.lpm_type               ("dcfifo"),
 	.lpm_width              (64),
-	.lpm_widthu             (9),
+	.lpm_widthu             (10),
 	.overflow_checking      ("ON"),
 	.rdsync_delaypipe       (4),
 	.underflow_checking     ("ON"),

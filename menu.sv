@@ -33,7 +33,9 @@ assign DDRAM_CLK = clk_sys;
 assign CE_PIXEL  = ce_pix;
 
 assign VGA_SL = 0;
-assign VGA_F1 = 0;
+// 480i interlace field (held 0 by native_video_timing in progressive modes).
+wire native_field;
+assign VGA_F1 = native_field;
 assign VIDEO_ARX = 0;
 assign VIDEO_ARY = 0;
 assign VGA_SCALER= 0;
@@ -49,19 +51,18 @@ assign BUTTONS = 0;
 
 reg  [26:0] act_cnt;
 always @(posedge clk_sys) act_cnt <= act_cnt + 1'd1; 
-assign LED_USER    = FB ? led[0] : act_cnt[26]  ? act_cnt[25:18]  > act_cnt[7:0]  : act_cnt[25:18]  <= act_cnt[7:0];
+assign LED_USER    = FB ? led[0] : act_cnt[26] ? act_cnt[25:18] > act_cnt[7:0] : act_cnt[25:18] <= act_cnt[7:0];
 
 wire [26:0] act_cnt2 = {~act_cnt[26],act_cnt[25:0]};
 assign LED_POWER[0]= FB ? led[2] : act_cnt2[26] ? act_cnt2[25:18] > act_cnt2[7:0] : act_cnt2[25:18] <= act_cnt2[7:0];
 
 
-`include "build_id.v" 
-// Centering: 4-bit signed, OSD order 0,+1..+7,-8..-1 so status=0 means no shift
+`include "build_id.v"
+// Centering offsets, signed: H status[15:10], V status[21:16]
 localparam CONF_STR = {
 	"MENU;UART31250,MIDI;",
 	"-;",
-	"O[13:10],H Offset,0,+1,+2,+3,+4,+5,+6,+7,-8,-7,-6,-5,-4,-3,-2,-1;",
-	"O[17:14],V Offset,0,+1,+2,+3,+4,+5,+6,+7,-8,-7,-6,-5,-4,-3,-2,-1;",
+	"O[24:22],Video Mode,NTSC 240p,480i 640,PAL 288p,480i 720,576i PAL;",
 	"-;",
 	"V,v",`BUILD_DATE
 };
@@ -69,13 +70,25 @@ localparam CONF_STR = {
 wire forced_scandoubler;
 wire [31:0] status;
 
+// SNAC always enabled, status[9] is the native-FB mode not SNAC
+wire [15:0] snac_buttons_wire;
+wire        snac_valid;
+wire        snac_enable = 1'b1;
+wire [7:0]  snac_debug_byte1;
+wire [7:0]  snac_debug_byte2;
+wire [3:0]  snac_debug_state;
+wire [15:0] snac_debug_word = {snac_debug_state, snac_valid, USER_IN[4], USER_IN[3],
+                               |snac_buttons_wire, snac_buttons_wire[7:4], 4'b0};
+
 hps_io #(.CONF_STR(CONF_STR)) hps_io
 (
 	.clk_sys(clk_sys),
 	.HPS_BUS(HPS_BUS),
 	.forced_scandoubler(forced_scandoubler),
 	.status(status),
-	.status_menumask(cfg)
+	.status_menumask(cfg),
+	.snac_buttons(snac_buttons_wire),
+	.snac_debug(snac_debug_word)
 );
 
 ////////////////////   CLOCKS   ///////////////////
@@ -213,14 +226,30 @@ end
 reg [15:0] mt32_i2s_r, mt32_i2s_l;
 wire midi_rx;
 
-assign AUDIO_L = mt32_i2s_l;
-assign AUDIO_R = mt32_i2s_r;
+assign AUDIO_L = snac_enable ? 16'd0 : mt32_i2s_l;
+assign AUDIO_R = snac_enable ? 16'd0 : mt32_i2s_r;
 assign AUDIO_S = 1;
 
-assign USER_OUT[0]   = 1;
-assign USER_OUT[1]   = UART_RXD;
-assign USER_OUT[6:2] = '1;
-assign UART_TXD      = midi_rx;
+wire [6:0] snac_user_out;
+assign USER_OUT = snac_enable ? snac_user_out : {5'b11111, UART_RXD, 1'b1};
+assign UART_TXD = snac_enable ? 1'b1 : midi_rx;
+
+ps1_snac_controller ps1_snac_inst (
+	.clk_sys(clk_sys),
+	.reset(RESET),
+	.USER_IN(USER_IN),
+	.USER_OUT(snac_user_out),
+	.snac_enable(snac_enable),
+	.buttons(snac_buttons_wire),
+	.controller_valid(snac_valid),
+	.debug_rx_byte1(snac_debug_byte1),
+	.debug_rx_byte2(snac_debug_byte2),
+	.debug_state(snac_debug_state),
+	.btn_select(), .btn_l3(), .btn_r3(), .btn_start(),
+	.btn_up(), .btn_right(), .btn_down(), .btn_left(),
+	.btn_l2(), .btn_r2(), .btn_l1(), .btn_r1(),
+	.btn_triangle(), .btn_circle(), .btn_cross(), .btn_square()
+);
 
 
 //
@@ -309,17 +338,21 @@ wire PAL = status[4];
 wire FB  = status[5];
 wire [2:0] led = status[8:6];
 
-// CLK_VIDEO 27.027 MHz, ce_pix /4 gives the NTSC 15.734 kHz line rate
+// Video standard, status[24:22]: 0=NTSC 240p 1=480i 640 2=PAL 288p 3=480i 720 4=576i PAL
+wire [2:0] native_mode = status[24:22];
+wire       native_is_interlaced = (native_mode == 3'd1) || (native_mode == 3'd3) || (native_mode == 3'd4);
+
+// ce_pix from CLK_VIDEO (~27 MHz): /4 for 240p/288p, /2 for interlaced 480i/576i.
 reg [1:0] ce_div;
 reg       ce_pix;
 always @(posedge CLK_VIDEO) begin
 	if (RESET) ce_div <= 2'd0;
 		else  ce_div <= ce_div + 2'd1;
-	ce_pix <= (ce_div == 2'd0);
+	ce_pix <= native_is_interlaced ? ce_div[0] : (ce_div == 2'd0);
 end
 
 // Native timing + DDR reader drive all VGA scanout
-wire mode_zaparoo = status[9];
+wire native_fb_on = status[9];
 
 wire [7:0] native_r;
 wire [7:0] native_g;
@@ -358,12 +391,14 @@ native_video_top native_video
 	.vga_vblank     (),
 	.vga_vcount     (native_vcount),
 	.vga_new_frame  (native_new_frame),
-	.enable         (mode_zaparoo),
+	.vga_field      (native_field),
+	.enable         (native_fb_on),
 	.active         (native_active),
 
-	// 4-bit fields read as signed, OSD enum order matches two's complement
-	.h_offset       ($signed(status[13:10])),
-	.v_offset       ($signed(status[17:14]))
+	.mode           (native_mode),
+
+	.h_offset       ($signed(status[15:10])),
+	.v_offset       ($signed(status[21:16]))
 );
 
 // Cosine + LFSR fallback pattern in the 320x240 active area
@@ -387,7 +422,7 @@ cos cos(vvc + {native_vcount, 2'b00}, cos_out);
 wire [7:0] comp_v = (cos_g >= rnd_c) ? {cos_g - rnd_c, 2'b00} : 8'd0;
 
 // status[9]=1 with a ready frame swaps DDR RGB in for the pattern
-wire use_native = mode_zaparoo & native_active;
+wire use_native = native_fb_on & native_active;
 
 assign VGA_DE  = native_de;
 assign VGA_HS  = native_hs;

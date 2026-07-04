@@ -37,3 +37,7 @@ c5_pin_model_dump.txt
 *.xml
 *_netlist
 *.cdf
+
+# macOS AppleDouble junk (exFAT volume)
+._*
+.DS_Store

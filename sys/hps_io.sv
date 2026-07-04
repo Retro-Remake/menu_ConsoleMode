@@ -120,6 +120,8 @@ module hps_io #(parameter CONF_STR, CONF_STR_BRAM=0, PS2DIV=0, WIDE=0, VDNUM=1, 
 	input      [127:0] status_in,
 	input              status_set,
 	input       [15:0] status_menumask,
+	input       [15:0] snac_buttons,  // ConsoleMode: PS1 SNAC buttons via 0x2E
+	input       [15:0] snac_debug,    // ConsoleMode: SNAC debug word via 0x2E
 
 	input             info_req,
 	input       [7:0] info,
@@ -519,7 +521,11 @@ always@(posedge clk_sys) begin : uio_block
 						end
 
 				//menu mask
-				'h2E: if(byte_cnt == 1) io_dout <= status_menumask;
+				'h2E: case(byte_cnt)
+				         1: io_dout <= status_menumask;
+				         2: io_dout <= snac_buttons;
+				         3: io_dout <= snac_debug;
+				      endcase
 
 				//sdram size set
 				'h31: if(byte_cnt == 1) sdram_sz <= io_din;

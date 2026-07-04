@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Retro-Remake
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// Native video wrapper: timing + RGBX8888 DDR reader
+// Native video wrapper: timing + RGBX8888 DDR reader.
 
 module native_video_top
 (
@@ -30,13 +30,16 @@ module native_video_top
 	output wire        vga_vblank,
 	output wire  [8:0] vga_vcount,
 	output wire        vga_new_frame,
+	output wire        vga_field,
 
 	input  wire        enable,
 	output wire        active,
 
-	// OSD image centering: signed -8..+7 pixels/lines, 0 = no shift.
-	input  wire signed [3:0] h_offset,
-	input  wire signed [3:0] v_offset
+	// Video standard: 0=NTSC 240p, 1=480i 640, 2=PAL 288p, 3=480i 720, 4=576i PAL.
+	input  wire  [2:0] mode,
+
+	input  wire signed [5:0] h_offset,
+	input  wire signed [5:0] v_offset
 );
 
 wire       tim_hs;
@@ -47,12 +50,14 @@ wire       tim_de;
 wire [8:0] tim_vcount;
 wire       tim_new_frame;
 wire       tim_new_line;
+wire       tim_field;
 
 native_video_timing timing
 (
 	.clk       (clk_vid),
 	.ce_pix    (ce_pix),
 	.reset     (reset),
+	.mode      (mode),
 	.h_offset  (h_offset),
 	.v_offset  (v_offset),
 	.hsync     (tim_hs),
@@ -63,7 +68,8 @@ native_video_timing timing
 	.hcount    (),
 	.vcount    (tim_vcount),
 	.new_frame (tim_new_frame),
-	.new_line  (tim_new_line)
+	.new_line  (tim_new_line),
+	.field     (tim_field)
 );
 
 wire frame_ready;
@@ -89,6 +95,8 @@ native_video_reader reader
 	.new_frame      (tim_new_frame),
 	.new_line       (tim_new_line),
 	.vcount         (tim_vcount),
+	.mode           (mode),
+	.field          (tim_field),
 
 	.r_out          (vga_r),
 	.g_out          (vga_g),
@@ -104,6 +112,7 @@ assign vga_hblank    = tim_hblank;
 assign vga_vblank    = tim_vblank;
 assign vga_vcount    = tim_vcount;
 assign vga_new_frame = tim_new_frame;
+assign vga_field     = tim_field;
 assign active        = enable & frame_ready;
 
 endmodule

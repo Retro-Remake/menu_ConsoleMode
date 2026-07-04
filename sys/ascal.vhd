@@ -460,9 +460,11 @@ ARCHITECTURE rtl OF ascal IS
 	ATTRIBUTE ramstyle of pal1_mem : signal is "no_rw_check";
 	ATTRIBUTE ramstyle of pal2_mem : signal is "no_rw_check";
 	SIGNAL o_htotal,o_hsstart,o_hsend : uint12;
+	SIGNAL o_htotal_m1 : uint12; -- ConsoleMode
 	SIGNAL o_hmin,o_hmax,o_hdisp,o_v_hmin_adj : uint12;
 	SIGNAL o_hsize,o_vsize : uint12;
 	SIGNAL o_vtotal,o_vsstart,o_vsend : uint12;
+	SIGNAL o_vtotal_m1 : uint12; -- ConsoleMode
 	SIGNAL o_vrr,o_isync,o_isync2 : std_logic;
 	SIGNAL o_vrr_sync,o_vrr_sync2 : boolean;
 	SIGNAL o_vrr_min,o_vrr_min2 : boolean;
@@ -1030,6 +1032,7 @@ ARCHITECTURE rtl OF ascal IS
 	SIGNAL o_poly_phase_b,o_poly_phase_b2,o_poly_phase_b3 : poly_phase_t;
 	SIGNAL o_v_poly_phase, o_v_poly_phase2, o_h_poly_phase, o_poly_phase, o_poly_phase1 : poly_phase_interp_t;
 	SIGNAL o_v_poly_pix, o_h_poly_pix, o_h_lum_pix, o_v_lum_pix : type_pix;
+	SIGNAL o_rlast : type_pix; -- ConsoleMode: previous output pixel (last-column replicate)
 	SIGNAL o_poly_lum, o_poly_lum1 : unsigned(7 DOWNTO 0);
 	SIGNAL o_poly_lerp_ta, o_poly_lerp_tb : signed(9 DOWNTO 0);
 	SIGNAL o_h_poly_t,o_h_poly_t2,o_v_poly_t   : type_poly_t;
@@ -1886,6 +1889,7 @@ BEGIN
 			o_run    <=run; -- <ASYNC> ?
 
 			o_htotal <=htotal; -- <ASYNC> ?
+			o_htotal_m1 <=htotal - 1; -- <ASYNC> ?
 			o_hsstart<=hsstart; -- <ASYNC> ?
 			o_hsend  <=hsend; -- <ASYNC> ?
 			o_hdisp  <=hdisp; -- <ASYNC> ?
@@ -1893,6 +1897,7 @@ BEGIN
 			o_hmax   <=hmax; -- <ASYNC> ?
 
 			o_vtotal <=vtotal; -- <ASYNC> ?
+			o_vtotal_m1 <=vtotal - 1; -- <ASYNC> ?
 			o_vsstart<=vsstart; -- <ASYNC> ?
 			o_vsend  <=vsend; -- <ASYNC> ?
 			o_vdisp  <=vdisp; -- <ASYNC> ?
@@ -2760,7 +2765,7 @@ BEGIN
 
 			IF o_ce='1' THEN
 				-- Output pixels count
-				IF o_hcpt+1<o_htotal THEN
+				IF o_hcpt<o_htotal_m1 THEN
 					o_hcpt<=(o_hcpt+1) MOD 4096;
 				ELSE
 					o_hcpt<=0;
@@ -2769,7 +2774,7 @@ BEGIN
 						o_vcpt_sync <= o_vcpt_sync+1;
 					END IF;
 
-					IF o_vcpt_pre3+1>=o_vtotal THEN
+					IF o_vcpt_pre3>=o_vtotal_m1 THEN
 						o_vcpt_pre3<=0;
 					ELSIF o_vrr_sync2 THEN
 						o_vcpt_pre3<=o_vsstart;
@@ -2837,6 +2842,7 @@ BEGIN
 		VARIABLE r1_v, r2_v : natural RANGE 0 TO OHRESH-1;
 		VARIABLE fracnn_v : std_logic;
 		VARIABLE o_l0_v, o_l1_v, o_l2_v, o_l3_v : type_pix;
+		VARIABLE opix_v : type_pix; -- ConsoleMode: output pixel (for last-column replicate)
 	BEGIN
 		IF rising_edge(o_clk) THEN
 			IF o_ce='1' THEN
@@ -2972,45 +2978,43 @@ BEGIN
 				o_vs<=o_vsv(11);
 				o_de<=o_dev(11);
 				o_vbl<=o_end(11);
-				o_r<=x"00";
-				o_g<=x"00";
-				o_b<=x"00";
 				o_brd<= not o_pev(11);
 
+				opix_v := (r=>x"00", g=>x"00", b=>x"00");
 				CASE o_vmode(2 DOWNTO 0) IS
 					WHEN "000" => -- Nearest
 						IF MASK(MASK_NEAREST)='1' THEN
-							o_r<=o_v_poly_pix.r;
-							o_g<=o_v_poly_pix.g;
-							o_b<=o_v_poly_pix.b;
+							opix_v := o_v_poly_pix;
 						END IF;
 					WHEN "001" | "010" => -- Bilinear | Sharp Bilinear
 						IF MASK(MASK_BILINEAR)='1' OR
 							 MASK(MASK_SHARP_BILINEAR)='1' THEN
-							o_r<=o_v_bil_pix.r;
-							o_g<=o_v_bil_pix.g;
-							o_b<=o_v_bil_pix.b;
+							opix_v := o_v_bil_pix;
 						END IF;
 					WHEN "011" => -- BiCubic
 						IF MASK(MASK_BICUBIC)='1' THEN
-							o_r<=o_v_bic_pix.r;
-							o_g<=o_v_bic_pix.g;
-							o_b<=o_v_bic_pix.b;
+							opix_v := o_v_bic_pix;
 						END IF;
 
 					WHEN OTHERS => -- Polyphase
 						IF MASK(MASK_POLY)='1' THEN
-							o_r<=o_v_poly_pix.r;
-							o_g<=o_v_poly_pix.g;
-							o_b<=o_v_poly_pix.b;
+							opix_v := o_v_poly_pix;
 						END IF;
 				END CASE;
 
 				IF o_pev(11)='0' THEN
-					o_r<=o_border(23 DOWNTO 16); -- Copy border colour
-					o_g<=o_border(15 DOWNTO 8);
-					o_b<=o_border(7  DOWNTO 0);
+					opix_v := (r=>o_border(23 DOWNTO 16),
+								  g=>o_border(15 DOWNTO 8),
+								  b=>o_border(7  DOWNTO 0)); -- Copy border colour
 				END IF;
+
+				-- ConsoleMode: o_line right-edge read underruns at tight blanking, replicate the prior pixel into the last column
+				IF o_pev(11)='1' AND o_pev(10)='0' THEN
+					o_r<=o_rlast.r; o_g<=o_rlast.g; o_b<=o_rlast.b;
+				ELSE
+					o_r<=opix_v.r; o_g<=opix_v.g; o_b<=opix_v.b;
+				END IF;
+				o_rlast<=opix_v;
 
 				----------------------------------------------------
 			END IF;
