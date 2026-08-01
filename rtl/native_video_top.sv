@@ -1,13 +1,13 @@
 // Copyright (C) 2026 Retro-Remake
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// Native video wrapper: timing + RGBX8888 DDR reader.
+// Native video wrapper: timing + RGBX8888 DDR reader
 
 module native_video_top
 (
 	input  wire        clk_sys,
 	input  wire        clk_vid,
-	input  wire        ce_pix,
+	input  wire        ce_timing,
 	input  wire        reset,
 
 	input  wire        ddr_busy,
@@ -35,18 +35,21 @@ module native_video_top
 	input  wire        enable,
 	output wire        active,
 
-	// Video standard: 0=NTSC 240p, 1=480i 640, 2=PAL 288p, 3=480i 720, 4=576i PAL.
+	// 0=NTSC 240p, 1=480i 640, 2=PAL 288p, 3=480i 720, 4=576i PAL
 	input  wire  [2:0] mode,
-
 	input  wire signed [5:0] h_offset,
 	input  wire signed [5:0] v_offset
 );
+
+localparam [2:0] MODE_NTSC = 3'd0;
+localparam [2:0] MODE_PAL  = 3'd2;
 
 wire       tim_hs;
 wire       tim_vs;
 wire       tim_hblank;
 wire       tim_vblank;
 wire       tim_de;
+wire [9:0] tim_hcount;
 wire [8:0] tim_vcount;
 wire       tim_new_frame;
 wire       tim_new_line;
@@ -55,7 +58,7 @@ wire       tim_field;
 native_video_timing timing
 (
 	.clk       (clk_vid),
-	.ce_pix    (ce_pix),
+	.ce_pix    (ce_timing),
 	.reset     (reset),
 	.mode      (mode),
 	.h_offset  (h_offset),
@@ -65,15 +68,18 @@ native_video_timing timing
 	.hblank    (tim_hblank),
 	.vblank    (tim_vblank),
 	.de        (tim_de),
-	.hcount    (),
+	.hcount    (tim_hcount),
 	.vcount    (tim_vcount),
 	.new_frame (tim_new_frame),
 	.new_line  (tim_new_line),
 	.field     (tim_field)
 );
 
-wire frame_ready;
+// double low-res pixels on even hcount, phase restarts per line (odd totals would drift it)
+wire low_resolution = (mode == MODE_NTSC) || (mode == MODE_PAL);
+wire reader_ce      = ce_timing && (!low_resolution || !tim_hcount[0]);
 
+wire frame_ready;
 native_video_reader reader
 (
 	.ddr_clk        (clk_sys),
@@ -86,22 +92,21 @@ native_video_reader reader
 	.ddr_din        (ddr_din),
 	.ddr_be         (ddr_be),
 	.ddr_we         (ddr_we),
-
 	.clk_vid        (clk_vid),
-	.ce_pix         (ce_pix),
+	.ce_pix         (reader_ce),
 	.reset          (reset),
 	.de             (tim_de),
 	.vblank         (tim_vblank),
 	.new_frame      (tim_new_frame),
 	.new_line       (tim_new_line),
 	.vcount         (tim_vcount),
-	.mode           (mode),
+	.mode_vid       (mode),
 	.field          (tim_field),
 
 	.r_out          (vga_r),
 	.g_out          (vga_g),
 	.b_out          (vga_b),
-	.enable         (enable),
+	.enable_sys     (enable),
 	.frame_ready    (frame_ready)
 );
 

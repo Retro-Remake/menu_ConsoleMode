@@ -30,7 +30,7 @@ assign {UART_RTS, UART_DTR} = 0;
 assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 
 assign DDRAM_CLK = clk_sys;
-assign CE_PIXEL  = ce_pix;
+assign CE_PIXEL  = ce_timing;
 
 assign VGA_SL = 0;
 // 480i interlace field (held 0 by native_video_timing in progressive modes).
@@ -338,20 +338,17 @@ wire PAL = status[4];
 wire FB  = status[5];
 wire [2:0] led = status[8:6];
 
-// Video standard, status[24:22]: 0=NTSC 240p 1=480i 640 2=PAL 288p 3=480i 720 4=576i PAL
+// status[24:22]: 0=NTSC 240p, 1=480i 640, 2=PAL 288p, 3=480i 720, 4=576i PAL
 wire [2:0] native_mode = status[24:22];
-wire       native_is_interlaced = (native_mode == 3'd1) || (native_mode == 3'd3) || (native_mode == 3'd4);
 
-// ce_pix from CLK_VIDEO (~27 MHz): /4 for 240p/288p, /2 for interlaced 480i/576i.
-reg [1:0] ce_div;
-reg       ce_pix;
+// one CLK_VIDEO/2 timing grid for every mode, low-res pixels doubled in native_video_top
+reg ce_timing;
 always @(posedge CLK_VIDEO) begin
-	if (RESET) ce_div <= 2'd0;
-		else  ce_div <= ce_div + 2'd1;
-	ce_pix <= native_is_interlaced ? ce_div[0] : (ce_div == 2'd0);
+	if(RESET) ce_timing <= 1'b0;
+	else      ce_timing <= ~ce_timing;
 end
 
-// Native timing + DDR reader drive all VGA scanout
+// Native timing + DDR reader drive all VGA scanout.
 wire native_fb_on = status[9];
 
 wire [7:0] native_r;
@@ -368,7 +365,7 @@ native_video_top native_video
 (
 	.clk_sys        (clk_sys),
 	.clk_vid        (CLK_VIDEO),
-	.ce_pix         (ce_pix),
+	.ce_timing      (ce_timing),
 	.reset          (RESET),
 
 	.ddr_busy       (DDRAM_BUSY),
@@ -396,12 +393,11 @@ native_video_top native_video
 	.active         (native_active),
 
 	.mode           (native_mode),
-
 	.h_offset       ($signed(status[15:10])),
 	.v_offset       ($signed(status[21:16]))
 );
 
-// Cosine + LFSR fallback pattern in the 320x240 active area
+// Cosine + LFSR fallback pattern.
 reg  [9:0] vvc;
 reg  [lfsr_n:0] rnd_reg;
 wire [lfsr_n:0] rnd;
@@ -411,8 +407,8 @@ lfsr #(lfsr_n) random(rnd);
 
 always @(posedge CLK_VIDEO) begin
 	if (RESET) vvc <= 10'd0;
-		else if (native_new_frame) vvc <= vvc + 10'd6;
-	if (ce_pix) rnd_reg <= rnd;
+	else if (native_new_frame) vvc <= vvc + 10'd6;
+	if (ce_timing) rnd_reg <= rnd;
 end
 
 reg  [7:0] cos_out;
@@ -421,7 +417,7 @@ cos cos(vvc + {native_vcount, 2'b00}, cos_out);
 
 wire [7:0] comp_v = (cos_g >= rnd_c) ? {cos_g - rnd_c, 2'b00} : 8'd0;
 
-// status[9]=1 with a ready frame swaps DDR RGB in for the pattern
+// status[9]=1 with a ready frame swaps DDR RGB in for the pattern.
 wire use_native = native_fb_on & native_active;
 
 assign VGA_DE  = native_de;

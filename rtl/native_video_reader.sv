@@ -24,13 +24,13 @@ module native_video_reader
 	input  wire        new_frame,
 	input  wire        new_line,
 	input  wire  [8:0] vcount,
-	input  wire  [2:0] mode,
+	input  wire  [2:0] mode_vid,
 	input  wire        field,
 
 	output reg   [7:0] r_out,
 	output reg   [7:0] g_out,
 	output reg   [7:0] b_out,
-	input  wire        enable,
+	input  wire        enable_sys,
 	output wire        frame_ready
 );
 
@@ -48,13 +48,33 @@ localparam [28:0] CTRL_ADDR   = 29'h07400000;  // 0x3A000000
 localparam [28:0] BUF0_ADDR   = 29'h07400020;  // 0x3A000100 (fixed)
 localparam [19:0] TIMEOUT_MAX = 20'hF_FFFF;
 
+// mode comes from CLK_VIDEO, sync into the DDR domain before it drives geometry
+(* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED_IF_ASYNCHRONOUS" *)
+reg [2:0] mode_meta_ddr;
+(* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED_IF_ASYNCHRONOUS" *)
+reg [2:0] mode_sync_ddr;
+reg [2:0] mode_ddr;
+
+always @(posedge ddr_clk) begin
+	if(reset) begin
+		mode_meta_ddr <= MODE_NTSC;
+		mode_sync_ddr <= MODE_NTSC;
+	end
+	else begin
+		mode_meta_ddr <= mode_vid;
+		mode_sync_ddr <= mode_meta_ddr;
+	end
+end
+
+wire mode_change_ddr = (mode_sync_ddr != mode_ddr);
+
 // Per-mode geometry.
 reg [8:0] line_words;      // 64-bit words per source line
 reg [8:0] scan_lines;      // active display lines fetched per frame/field
 reg       scan_interlaced; // 480i: source line = display_line*2 + field
 reg       two_bursts;
 always @* begin
-	case(mode)
+	case(mode_ddr)
 	MODE_480I:    begin line_words = 9'd320; scan_lines = 9'd240; scan_interlaced = 1'b1; two_bursts = 1'b1; end
 	MODE_480I_D1: begin line_words = 9'd360; scan_lines = 9'd240; scan_interlaced = 1'b1; two_bursts = 1'b1; end
 	MODE_PAL:     begin line_words = 9'd176; scan_lines = 9'd288; scan_interlaced = 1'b0; two_bursts = 1'b0; end
@@ -66,7 +86,7 @@ end
 reg [1:0] enable_sync;
 always @(posedge ddr_clk) begin
 	if(reset) enable_sync <= 2'b0;
-		else enable_sync <= {enable_sync[0], enable};
+		else enable_sync <= {enable_sync[0], enable_sys};
 end
 wire enable_ddr = enable_sync[1];
 
@@ -134,6 +154,7 @@ reg         preloading;
 reg         fetch_field;       // field latched at fetch start (consistent per field)
 reg         burst_idx;         // 480i: 0 = first 180-word burst, 1 = second
 reg  [19:0] timeout_cnt;
+reg         mode_reload_pending;
 reg         fifo_wr;
 reg  [63:0] fifo_wr_data;
 wire        fifo_full;
@@ -170,9 +191,27 @@ always @(posedge ddr_clk) begin
 		fetch_field        <= 1'b0;
 		burst_idx          <= 1'b0;
 		timeout_cnt        <= 20'd0;
+		mode_ddr          <= MODE_NTSC;
+		mode_reload_pending <= 1'b0;
 		fifo_wr            <= 1'b0;
 		fifo_wr_data       <= 64'd0;
 		fifo_aclr_cnt      <= 4'd0;
+	end
+	else if(mode_change_ddr) begin
+		// stop the old geometry, next frame boundary reloads with the new mode
+		mode_ddr            <= mode_sync_ddr;
+		state               <= ST_IDLE;
+		ddr_rd              <= 1'b0;
+		cur_line            <= 9'd0;
+		beat_count          <= 8'd0;
+		burst_idx           <= 1'b0;
+		first_frame_loaded  <= 1'b0;
+		frame_ready_reg     <= 1'b0;
+		preloading          <= 1'b0;
+		timeout_cnt         <= 20'd0;
+		mode_reload_pending <= 1'b1;
+		fifo_wr             <= 1'b0;
+		fifo_aclr_cnt       <= 4'd8;
 	end
 	else begin
 		fifo_wr <= 1'b0;
@@ -213,8 +252,9 @@ always @(posedge ddr_clk) begin
 
 			ST_CHECK_CTRL: begin
 				// unchanged counter still re-fetches, that's how 480i shows the other field
-				if(ctrl_word[31:2] != prev_frame_counter) begin
-					prev_frame_counter <= ctrl_word[31:2];
+				if(mode_reload_pending || (ctrl_word[31:2] != prev_frame_counter)) begin
+					prev_frame_counter   <= ctrl_word[31:2];
+					mode_reload_pending <= 1'b0;
 					buf_base_addr      <= ctrl_word[0] ? buf1_addr : BUF0_ADDR;
 					cur_line           <= 9'd0;
 					burst_idx          <= 1'b0;
