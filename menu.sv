@@ -338,18 +338,34 @@ wire PAL = status[4];
 wire FB  = status[5];
 wire [2:0] led = status[8:6];
 
-// status[24:22]: 0=NTSC 240p, 1=480i 640, 2=PAL 288p, 3=480i 720, 4=576i PAL
-wire [2:0] native_mode = status[24:22];
+// status[24:22]: 0=NTSC 240p, 1=480i 640, 2=PAL 288p, 3=480i 720, 4=576i PAL, 5=480p, 6=576p, 7=480p 640
+// hps_io mode bits are async, 2-FF them into the video clock
+reg [2:0] native_mode_m = 3'd0;
+reg [2:0] native_mode   = 3'd0;
+reg [5:0] native_hoff_m = 6'd0, native_hoff = 6'd0;
+reg [5:0] native_voff_m = 6'd0, native_voff = 6'd0;
+reg       native_fb_m   = 1'b0, native_fb_v = 1'b0;
+always @(posedge CLK_VIDEO) begin
+	native_mode_m <= status[24:22];
+	native_mode   <= native_mode_m;
+	native_hoff_m <= status[15:10];
+	native_hoff   <= native_hoff_m;
+	native_voff_m <= status[21:16];
+	native_voff   <= native_voff_m;
+	native_fb_m   <= status[9];
+	native_fb_v   <= native_fb_m;
+end
 
-// one CLK_VIDEO/2 timing grid for every mode, low-res pixels doubled in native_video_top
+// CLK_VIDEO/2 grid for the 15kHz modes, 480p/576p gate every clock for the full 27MHz rate
+wire ce_full_rate = (native_mode >= 3'd5);
 reg ce_timing;
 always @(posedge CLK_VIDEO) begin
 	if(RESET) ce_timing <= 1'b0;
-	else      ce_timing <= ~ce_timing;
+	else      ce_timing <= ce_full_rate ? 1'b1 : ~ce_timing;
 end
 
 // Native timing + DDR reader drive all VGA scanout.
-wire native_fb_on = status[9];
+wire native_fb_on = native_fb_v;
 
 wire [7:0] native_r;
 wire [7:0] native_g;
@@ -357,7 +373,7 @@ wire [7:0] native_b;
 wire       native_hs;
 wire       native_vs;
 wire       native_de;
-wire [8:0] native_vcount;
+wire [9:0] native_vcount;
 wire       native_new_frame;
 wire       native_active;
 
@@ -393,8 +409,8 @@ native_video_top native_video
 	.active         (native_active),
 
 	.mode           (native_mode),
-	.h_offset       ($signed(status[15:10])),
-	.v_offset       ($signed(status[21:16]))
+	.h_offset       ($signed(native_hoff)),
+	.v_offset       ($signed(native_voff))
 );
 
 // Cosine + LFSR fallback pattern.

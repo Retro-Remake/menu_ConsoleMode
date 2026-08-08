@@ -28,14 +28,14 @@ module native_video_top
 	output wire        vga_de,
 	output wire        vga_hblank,
 	output wire        vga_vblank,
-	output wire  [8:0] vga_vcount,
+	output wire  [9:0] vga_vcount,
 	output wire        vga_new_frame,
 	output wire        vga_field,
 
 	input  wire        enable,
 	output wire        active,
 
-	// 0=NTSC 240p, 1=480i 640, 2=PAL 288p, 3=480i 720, 4=576i PAL
+	// 0=NTSC 240p, 1=480i 640, 2=PAL 288p, 3=480i 720, 4=576i PAL, 5=480p, 6=576p, 7=480p 640
 	input  wire  [2:0] mode,
 	input  wire signed [5:0] h_offset,
 	input  wire signed [5:0] v_offset
@@ -50,7 +50,7 @@ wire       tim_hblank;
 wire       tim_vblank;
 wire       tim_de;
 wire [9:0] tim_hcount;
-wire [8:0] tim_vcount;
+wire [9:0] tim_vcount;
 wire       tim_new_frame;
 wire       tim_new_line;
 wire       tim_field;

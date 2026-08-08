@@ -23,7 +23,7 @@ module native_video_reader
 	input  wire        vblank,
 	input  wire        new_frame,
 	input  wire        new_line,
-	input  wire  [8:0] vcount,
+	input  wire  [9:0] vcount,
 	input  wire  [2:0] mode_vid,
 	input  wire        field,
 
@@ -43,6 +43,9 @@ localparam [2:0] MODE_480I    = 3'd1;   // 640x480
 localparam [2:0] MODE_PAL     = 3'd2;
 localparam [2:0] MODE_480I_D1 = 3'd3;   // 720x480 (D1)
 localparam [2:0] MODE_576I    = 3'd4;   // 720x576i (PAL interlaced)
+localparam [2:0] MODE_480P    = 3'd5;   // 720x480 progressive
+localparam [2:0] MODE_576P    = 3'd6;   // 720x576 progressive
+localparam [2:0] MODE_480P_SQ = 3'd7;   // 640x480 progressive
 
 localparam [28:0] CTRL_ADDR   = 29'h07400000;  // 0x3A000000
 localparam [28:0] BUF0_ADDR   = 29'h07400020;  // 0x3A000100 (fixed)
@@ -70,16 +73,19 @@ wire mode_change_ddr = (mode_sync_ddr != mode_ddr);
 
 // Per-mode geometry.
 reg [8:0] line_words;      // 64-bit words per source line
-reg [8:0] scan_lines;      // active display lines fetched per frame/field
+reg [9:0] scan_lines;      // active display lines fetched per frame/field
 reg       scan_interlaced; // 480i: source line = display_line*2 + field
 reg       two_bursts;
 always @* begin
 	case(mode_ddr)
-	MODE_480I:    begin line_words = 9'd320; scan_lines = 9'd240; scan_interlaced = 1'b1; two_bursts = 1'b1; end
-	MODE_480I_D1: begin line_words = 9'd360; scan_lines = 9'd240; scan_interlaced = 1'b1; two_bursts = 1'b1; end
-	MODE_PAL:     begin line_words = 9'd176; scan_lines = 9'd288; scan_interlaced = 1'b0; two_bursts = 1'b0; end
-	MODE_576I:    begin line_words = 9'd360; scan_lines = 9'd288; scan_interlaced = 1'b1; two_bursts = 1'b1; end
-	default:      begin line_words = 9'd160; scan_lines = 9'd240; scan_interlaced = 1'b0; two_bursts = 1'b0; end
+	MODE_480I:    begin line_words = 9'd320; scan_lines = 10'd240; scan_interlaced = 1'b1; two_bursts = 1'b1; end
+	MODE_480I_D1: begin line_words = 9'd360; scan_lines = 10'd240; scan_interlaced = 1'b1; two_bursts = 1'b1; end
+	MODE_PAL:     begin line_words = 9'd176; scan_lines = 10'd288; scan_interlaced = 1'b0; two_bursts = 1'b0; end
+	MODE_576I:    begin line_words = 9'd360; scan_lines = 10'd288; scan_interlaced = 1'b1; two_bursts = 1'b1; end
+	MODE_480P:    begin line_words = 9'd360; scan_lines = 10'd480; scan_interlaced = 1'b0; two_bursts = 1'b1; end
+	MODE_576P:    begin line_words = 9'd360; scan_lines = 10'd576; scan_interlaced = 1'b0; two_bursts = 1'b1; end
+	MODE_480P_SQ: begin line_words = 9'd320; scan_lines = 10'd480; scan_interlaced = 1'b0; two_bursts = 1'b1; end
+	default:      begin line_words = 9'd160; scan_lines = 10'd240; scan_interlaced = 1'b0; two_bursts = 1'b0; end
 	endcase
 end
 
@@ -147,7 +153,7 @@ reg  [3:0]  state;
 reg  [31:0] ctrl_word;
 reg  [29:0] prev_frame_counter;
 reg  [28:0] buf_base_addr;
-reg  [8:0]  cur_line;
+reg  [9:0]  cur_line;
 reg  [7:0]  beat_count;
 reg         first_frame_loaded;
 reg         preloading;
@@ -171,18 +177,23 @@ wire fifo_aclr_ddr_active = (fifo_aclr_cnt != 4'd0);
 wire fifo_aclr = reset | fifo_aclr_ddr_active;
 
 // buf1 sits one full frame (all source lines) after buf0
-wire [9:0]  total_lines = scan_interlaced ? {scan_lines, 1'b0} : {1'b0, scan_lines};
+wire [9:0]  total_lines = scan_interlaced ? {scan_lines[8:0], 1'b0} : scan_lines;
 wire [28:0] buf1_addr   = BUF0_ADDR + (line_words * total_lines);
 
 // 480i/576i lines exceed the 255 burstcnt max so they fetch as two half-line bursts
 wire [8:0]  half_words = {1'b0, line_words[8:1]};   // line_words/2 (480i/576i: 180)
 // 10-bit: 576i src_line reaches 575
-wire [9:0]  src_line  = scan_interlaced ? ({cur_line, 1'b0} + {9'd0, fetch_field}) : {1'b0, cur_line};
+wire [9:0]  src_line  = scan_interlaced ? ({cur_line[8:0], 1'b0} + {9'd0, fetch_field}) : cur_line;
 // flicker filter: display line = avg of source lines 2L+f and 2L+f+1, last line blends with itself
 wire        blend_line = scan_interlaced;
 wire [9:0]  src_pair  = src_line + 10'd1;
 wire [9:0]  src_sel   = (pair_pass && (src_pair != total_lines)) ? src_pair : src_line;
-wire [28:0] line_base = buf_base_addr + (src_sel * line_words) + (burst_idx ? {20'd0, half_words} : 29'd0);
+// multiply runs in a DSP, the address issues after two settle cycles
+(* multstyle = "dsp" *) wire [18:0] line_mul_w = src_sel * line_words;
+reg  [18:0] line_mul;
+reg  [1:0]  addr_ok;
+
+always @(posedge ddr_clk) line_mul <= line_mul_w;
 wire [7:0]  burst_len = two_bursts ? half_words[7:0] : line_words[7:0];
 
 always @(posedge ddr_clk) begin
@@ -194,7 +205,7 @@ always @(posedge ddr_clk) begin
 		ctrl_word          <= 32'd0;
 		prev_frame_counter <= 30'd0;
 		buf_base_addr      <= BUF0_ADDR;
-		cur_line           <= 9'd0;
+		cur_line           <= 10'd0;
 		beat_count         <= 8'd0;
 		first_frame_loaded <= 1'b0;
 		frame_ready_reg    <= 1'b0;
@@ -210,13 +221,14 @@ always @(posedge ddr_clk) begin
 		fifo_wr            <= 1'b0;
 		fifo_wr_data       <= 64'd0;
 		fifo_aclr_cnt      <= 4'd0;
+		addr_ok            <= 2'd0;
 	end
 	else if(mode_change_ddr) begin
 		// stop the old geometry, next frame boundary reloads with the new mode
 		mode_ddr            <= mode_sync_ddr;
 		state               <= ST_IDLE;
 		ddr_rd              <= 1'b0;
-		cur_line            <= 9'd0;
+		cur_line            <= 10'd0;
 		beat_count          <= 8'd0;
 		burst_idx           <= 1'b0;
 		first_frame_loaded  <= 1'b0;
@@ -225,6 +237,7 @@ always @(posedge ddr_clk) begin
 		timeout_cnt         <= 20'd0;
 		mode_reload_pending <= 1'b1;
 		pair_pass           <= 1'b0;
+		addr_ok             <= 2'd0;
 		pair_valid_d        <= 1'b0;
 		line_word_idx       <= 9'd0;
 		fifo_wr             <= 1'b0;
@@ -288,7 +301,7 @@ always @(posedge ddr_clk) begin
 					prev_frame_counter   <= ctrl_word[31:2];
 					mode_reload_pending <= 1'b0;
 					buf_base_addr      <= ctrl_word[0] ? buf1_addr : BUF0_ADDR;
-					cur_line           <= 9'd0;
+					cur_line           <= 10'd0;
 					burst_idx          <= 1'b0;
 					pair_pass          <= 1'b0;
 					line_word_idx      <= 9'd0;
@@ -299,7 +312,7 @@ always @(posedge ddr_clk) begin
 					state              <= ST_READ_LINE;
 				end
 				else if(first_frame_loaded) begin
-					cur_line      <= 9'd0;
+					cur_line      <= 10'd0;
 					burst_idx     <= 1'b0;
 					pair_pass     <= 1'b0;
 					line_word_idx <= 9'd0;
@@ -314,12 +327,14 @@ always @(posedge ddr_clk) begin
 			end
 
 			ST_READ_LINE: begin
-				if(!ddr_busy && !fifo_aclr_ddr_active) begin
-					ddr_addr     <= line_base;
+				if(addr_ok != 2'd2) addr_ok <= addr_ok + 2'd1;
+				else if(!ddr_busy && !fifo_aclr_ddr_active) begin
+					ddr_addr     <= buf_base_addr + {10'd0, line_mul} + (burst_idx ? {20'd0, half_words} : 29'd0);
 					ddr_burstcnt <= burst_len;
 					ddr_rd       <= 1'b1;
 					beat_count   <= 8'd0;
 					timeout_cnt  <= 20'd0;
+					addr_ok      <= 2'd0;
 					state        <= ST_WAIT_LINE;
 				end
 			end
@@ -347,15 +362,15 @@ always @(posedge ddr_clk) begin
 			end
 
 			ST_LINE_DONE: begin
-				cur_line      <= cur_line + 9'd1;
+				cur_line      <= cur_line + 10'd1;
 				line_word_idx <= 9'd0;
-				if(cur_line == scan_lines - 9'd1) begin
+				if(cur_line == scan_lines - 10'd1) begin
 					first_frame_loaded <= 1'b1;
 					frame_ready_reg    <= 1'b1;
 					preloading         <= 1'b0;
 					state              <= ST_IDLE;
 				end
-				else if(preloading && cur_line < 9'd1) begin
+				else if(preloading && cur_line < 10'd1) begin
 					state <= ST_READ_LINE;
 				end
 				else begin
