@@ -155,9 +155,16 @@ reg         fetch_field;       // field latched at fetch start (consistent per f
 reg         burst_idx;         // 480i: 0 = first 180-word burst, 1 = second
 reg  [19:0] timeout_cnt;
 reg         mode_reload_pending;
+reg         pair_pass;         // 0 = fetch into linebuf, 1 = fetch + blend into FIFO
+reg         pair_valid_d;
+reg  [63:0] pair_data_d;
+reg  [8:0]  line_word_idx;
+reg  [63:0] linebuf_q;
 reg         fifo_wr;
 reg  [63:0] fifo_wr_data;
 wire        fifo_full;
+
+(* ramstyle = "M10K" *) reg [63:0] linebuf [0:511];
 
 reg [3:0] fifo_aclr_cnt;
 wire fifo_aclr_ddr_active = (fifo_aclr_cnt != 4'd0);
@@ -171,7 +178,11 @@ wire [28:0] buf1_addr   = BUF0_ADDR + (line_words * total_lines);
 wire [8:0]  half_words = {1'b0, line_words[8:1]};   // line_words/2 (480i/576i: 180)
 // 10-bit: 576i src_line reaches 575
 wire [9:0]  src_line  = scan_interlaced ? ({cur_line, 1'b0} + {9'd0, fetch_field}) : {1'b0, cur_line};
-wire [28:0] line_base = buf_base_addr + (src_line * line_words) + (burst_idx ? {20'd0, half_words} : 29'd0);
+// flicker filter: display line = avg of source lines 2L+f and 2L+f+1, last line blends with itself
+wire        blend_line = scan_interlaced;
+wire [9:0]  src_pair  = src_line + 10'd1;
+wire [9:0]  src_sel   = (pair_pass && (src_pair != total_lines)) ? src_pair : src_line;
+wire [28:0] line_base = buf_base_addr + (src_sel * line_words) + (burst_idx ? {20'd0, half_words} : 29'd0);
 wire [7:0]  burst_len = two_bursts ? half_words[7:0] : line_words[7:0];
 
 always @(posedge ddr_clk) begin
@@ -193,6 +204,9 @@ always @(posedge ddr_clk) begin
 		timeout_cnt        <= 20'd0;
 		mode_ddr          <= MODE_NTSC;
 		mode_reload_pending <= 1'b0;
+		pair_pass          <= 1'b0;
+		pair_valid_d       <= 1'b0;
+		line_word_idx      <= 9'd0;
 		fifo_wr            <= 1'b0;
 		fifo_wr_data       <= 64'd0;
 		fifo_aclr_cnt      <= 4'd0;
@@ -210,17 +224,35 @@ always @(posedge ddr_clk) begin
 		preloading          <= 1'b0;
 		timeout_cnt         <= 20'd0;
 		mode_reload_pending <= 1'b1;
+		pair_pass           <= 1'b0;
+		pair_valid_d        <= 1'b0;
+		line_word_idx       <= 9'd0;
 		fifo_wr             <= 1'b0;
 		fifo_aclr_cnt       <= 4'd8;
 	end
 	else begin
 		fifo_wr <= 1'b0;
+		pair_valid_d <= 1'b0;
 		if(fifo_aclr_cnt != 4'd0) fifo_aclr_cnt <= fifo_aclr_cnt - 4'd1;
 		if(!ddr_busy) ddr_rd <= 1'b0;
 
-		if(state == ST_WAIT_LINE && ddr_dout_ready) begin
+		// blend pass pipeline: beat N latched last cycle, linebuf word N ready now
+		if(pair_valid_d) begin
 			fifo_wr      <= 1'b1;
-			fifo_wr_data <= ddr_dout;
+			fifo_wr_data <= (pair_data_d & linebuf_q)
+			              + (((pair_data_d ^ linebuf_q) >> 1) & 64'h7F7F7F7F7F7F7F7F);
+		end
+
+		if(state == ST_WAIT_LINE && ddr_dout_ready) begin
+			if(!blend_line) begin
+				fifo_wr      <= 1'b1;
+				fifo_wr_data <= ddr_dout;
+			end
+			else if(pair_pass) begin
+				pair_data_d  <= ddr_dout;
+				pair_valid_d <= 1'b1;
+			end
+			line_word_idx <= line_word_idx + 9'd1;
 			beat_count   <= beat_count + 8'd1;
 			timeout_cnt  <= 20'd0;
 		end
@@ -258,6 +290,8 @@ always @(posedge ddr_clk) begin
 					buf_base_addr      <= ctrl_word[0] ? buf1_addr : BUF0_ADDR;
 					cur_line           <= 9'd0;
 					burst_idx          <= 1'b0;
+					pair_pass          <= 1'b0;
+					line_word_idx      <= 9'd0;
 					fetch_field        <= field_ddr;
 					preloading         <= 1'b1;
 					fifo_aclr_cnt      <= 4'd8;
@@ -267,6 +301,8 @@ always @(posedge ddr_clk) begin
 				else if(first_frame_loaded) begin
 					cur_line      <= 9'd0;
 					burst_idx     <= 1'b0;
+					pair_pass     <= 1'b0;
+					line_word_idx <= 9'd0;
 					fetch_field   <= field_ddr;
 					preloading    <= 1'b1;
 					fifo_aclr_cnt <= 4'd8;
@@ -294,8 +330,15 @@ always @(posedge ddr_clk) begin
 						burst_idx <= 1'b1;       // fetch the second half of the 480i line
 						state     <= ST_READ_LINE;
 					end
+					else if(blend_line && !pair_pass) begin
+						burst_idx     <= 1'b0;   // second pass fetches 2L+f+1
+						pair_pass     <= 1'b1;
+						line_word_idx <= 9'd0;
+						state         <= ST_READ_LINE;
+					end
 					else begin
 						burst_idx <= 1'b0;
+						pair_pass <= 1'b0;
 						state     <= ST_LINE_DONE;
 					end
 				end
@@ -304,7 +347,8 @@ always @(posedge ddr_clk) begin
 			end
 
 			ST_LINE_DONE: begin
-				cur_line <= cur_line + 9'd1;
+				cur_line      <= cur_line + 9'd1;
+				line_word_idx <= 9'd0;
 				if(cur_line == scan_lines - 9'd1) begin
 					first_frame_loaded <= 1'b1;
 					frame_ready_reg    <= 1'b1;
@@ -321,12 +365,22 @@ always @(posedge ddr_clk) begin
 			end
 
 			ST_WAIT_DISPLAY: begin
-				if(cur_line < scan_lines && new_line_ddr && !vblank_ddr) state <= ST_READ_LINE;
+				if(cur_line < scan_lines && new_line_ddr && !vblank_ddr) begin
+					line_word_idx <= 9'd0;
+					state         <= ST_READ_LINE;
+				end
 			end
 
 			default: state <= ST_IDLE;
 		endcase
 	end
+end
+
+// pair line buffer: pass 0 stores line 2L+f, pass 1 reads it back for the blend
+always @(posedge ddr_clk) begin
+	if(state == ST_WAIT_LINE && ddr_dout_ready && blend_line && !pair_pass)
+		linebuf[line_word_idx] <= ddr_dout;
+	linebuf_q <= linebuf[line_word_idx];
 end
 
 wire [63:0] fifo_rd_data;
