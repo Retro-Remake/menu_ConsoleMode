@@ -110,6 +110,7 @@ USE ieee.numeric_std.ALL;
 -- N_DW      : Avalon data bus width. 64 or 128 bits
 -- N_AW      : Avalon address bus width
 -- N_BURST   : Burst size in bytes. Power of two.
+-- N_SLOT    : Output bursts buffered. Power of two. Above 2 the framebuffer is read ahead.
 
 ENTITY ascal IS
 	GENERIC (
@@ -129,7 +130,8 @@ ENTITY ascal IS
 		IHRES        : natural RANGE 1 TO 2048 :=2048;
 		N_DW         : natural RANGE 64 TO 128 := 128;
 		N_AW         : natural RANGE 8 TO 32 := 32;
-		N_BURST      : natural := 256 -- 256 bytes per burst
+		N_BURST      : natural := 256; -- 256 bytes per burst
+		N_SLOT       : natural := 2
 		);
 	PORT (
 		------------------------------------
@@ -325,6 +327,7 @@ ARCHITECTURE rtl OF ascal IS
 	CONSTANT NB_BURST : natural :=ilog2(N_BURST);
 	CONSTANT NB_LA    : natural :=ilog2(N_DW/8); -- Low address bits
 	CONSTANT BLEN     : natural :=N_BURST / N_DW * 8; -- Burst length
+	CONSTANT N_AQ     : natural :=8;
 
 	----------------------------------------------------------
 	TYPE arr_dw IS  ARRAY (natural RANGE <>) OF unsigned(N_DW-1 DOWNTO 0);
@@ -414,7 +417,8 @@ ARCHITECTURE rtl OF ascal IS
 	SIGNAL avl_read_i,avl_read_sync,avl_read_sync2 : std_logic;
 	SIGNAL avl_read_pulse,avl_write_pulse : std_logic;
 	SIGNAL avl_read_sr,avl_write_sr,avl_read_clr,avl_write_clr : std_logic;
-	SIGNAL avl_rad,avl_rad_c,avl_wad : natural RANGE 0 TO 2*BLEN-1;
+	SIGNAL avl_rad,avl_rad_c : natural RANGE 0 TO 2*BLEN-1;
+	SIGNAL avl_wad : natural RANGE 0 TO N_SLOT*BLEN-1;
 	SIGNAL avl_walt,avl_wline,avl_rline : std_logic;
 	SIGNAL avl_dw,avl_dr : unsigned(N_DW-1 DOWNTO 0);
 	SIGNAL avl_wr : std_logic;
@@ -425,6 +429,27 @@ ARCHITECTURE rtl OF ascal IS
 	SIGNAL avl_reset_na : std_logic;
 	SIGNAL avl_o_vs_sync,avl_o_vs : std_logic;
 	SIGNAL avl_fb_ena : std_logic;
+	TYPE arr_slot IS ARRAY (natural RANGE <>) OF natural RANGE 0 TO N_SLOT-1;
+	TYPE arr_adrs IS ARRAY (natural RANGE <>) OF unsigned(31 DOWNTO 0);
+	TYPE arr_pend IS ARRAY (natural RANGE <>) OF natural RANGE 0 TO N_AQ;
+	SIGNAL avl_rslot,avl_iss_slot : natural RANGE 0 TO N_SLOT-1;
+	SIGNAL avl_rlbase,avl_iss_adr,avl_pfl,avl_rfull : unsigned(31 DOWNTO 0);
+	SIGNAL avl_rb,avl_pfb,avl_hburst : natural RANGE 0 TO 31;
+	SIGNAL avl_stride : unsigned(13 DOWNTO 0);
+	SIGNAL avl_rli,avl_pfli,avl_vsize : natural RANGE 0 TO 4095;
+	SIGNAL avl_iss_dem,avl_pfv,avl_read_sr2 : std_logic;
+	SIGNAL avl_c,avl_pfn,avl_kpre : unsigned(15 DOWNTO 0);
+	SIGNAL avl_hitpre,avl_pfok : boolean;
+	SIGNAL avl_tadr : arr_adrs(0 TO N_SLOT-1);
+	SIGNAL avl_pend : arr_pend(0 TO N_SLOT-1);
+	SIGNAL avl_ready : unsigned(0 TO N_SLOT-1);
+	SIGNAL avl_aq : arr_slot(0 TO N_AQ-1);
+	SIGNAL avl_aqr,avl_aqw : natural RANGE 0 TO N_AQ-1;
+	SIGNAL avl_aqn : natural RANGE 0 TO N_AQ;
+	SIGNAL avl_beat : natural RANGE 0 TO BLEN-1;
+	SIGNAL avl_kq : arr_slot(0 TO 3);
+	SIGNAL avl_kqr,avl_kqw : natural RANGE 0 TO 3;
+	SIGNAL avl_kqn : natural RANGE 0 TO 4;
 
 	FUNCTION buf_next(a,b : natural RANGE 0 TO 2; freeze : std_logic := '0') RETURN natural IS
 	BEGIN
@@ -488,13 +513,13 @@ ARCHITECTURE rtl OF ascal IS
 	SIGNAL o_adrs_pre : natural RANGE 0 TO 2**24-1;
 	SIGNAL o_stride : unsigned(13 DOWNTO 0);
 	SIGNAL o_adrsa,o_adrsb,o_rline : std_logic;
-	SIGNAL o_ad,o_ad1,o_ad2,o_ad3 : natural RANGE 0 TO 2*BLEN-1;
+	SIGNAL o_ad,o_ad1,o_ad2,o_ad3 : natural RANGE 0 TO N_SLOT*BLEN-1;
 	SIGNAL o_adturn : std_logic;
 	SIGNAL o_dr : unsigned(N_DW-1 DOWNTO 0);
 	SIGNAL o_shift : unsigned(0 TO N_DW+15);
 	SIGNAL o_sh,o_sh1,o_sh2,o_sh3,o_sh4 : std_logic;
 	SIGNAL o_reset_na : std_logic;
-	SIGNAL o_dpram : arr_dw(0 TO BLEN*2-1);
+	SIGNAL o_dpram : arr_dw(0 TO BLEN*N_SLOT-1);
 	ATTRIBUTE ramstyle OF o_dpram : SIGNAL IS "no_rw_check";
 	SIGNAL o_line0,o_line1,o_line2,o_line3 : arr_pix(0 TO OHRESL-1);
 	SIGNAL o_linf0,o_linf1,o_linf2,o_linf3 : arr_pix(0 TO OHRESM-1);
@@ -534,10 +559,14 @@ ARCHITECTURE rtl OF ascal IS
 	SIGNAL o_lastt1,o_lastt2,o_lastt3,o_lastt4 : std_logic;
 	SIGNAL o_alt,o_altx : unsigned(3 DOWNTO 0);
 	SIGNAL o_hdown,o_vdown : std_logic;
-	SIGNAL o_primv,o_lastv,o_bibv : unsigned(0 TO 2);
+	SIGNAL o_primv,o_lastv : unsigned(0 TO 2);
+	SIGNAL o_slotv : arr_slot(0 TO 2);
 	TYPE arr_uint4 IS ARRAY (natural RANGE <>) OF natural RANGE 0 TO 15;
 	SIGNAL o_off : arr_uint4(0 TO 2);
-	SIGNAL o_bibu : std_logic :='0';
+	SIGNAL o_slotu,o_rslot : natural RANGE 0 TO N_SLOT-1 :=0;
+	SIGNAL o_rlbase : unsigned(31 DOWNTO 0);
+	SIGNAL o_rb : natural RANGE 0 TO 31;
+	SIGNAL o_rli : natural RANGE 0 TO 4095;
 	SIGNAL o_dcptv : arr_uint12(13 TO 14);
 	SIGNAL o_dcpt_clr, o_dcpt_inc : std_logic;
 	SIGNAL o_dcptv_clr, o_dcptv_inc : std_logic_vector(1 TO 12);
@@ -1674,7 +1703,10 @@ BEGIN
 	-----------------------------------------------------------------------------
 	-- AVALON interface
 	Avaloir:PROCESS(avl_clk,avl_reset_na) IS
-		VARIABLE adr_v : unsigned(31 DOWNTO 0);
+		VARIABLE adr_v,base_v : unsigned(31 DOWNTO 0);
+		VARIABLE k_v,d_v : unsigned(15 DOWNTO 0);
+		VARIABLE resync_v,inc_v,dec_v,kpush_v,kpop_v,req_v : boolean;
+		VARIABLE inc_s,dec_s : natural RANGE 0 TO N_SLOT-1;
 	BEGIN
 		IF avl_reset_na='0' THEN
 			avl_state<=sIDLE;
@@ -1682,6 +1714,14 @@ BEGIN
 			avl_read_sr<='0';
 			avl_readdataack<='0';
 			avl_readack<='0';
+			avl_c<=(OTHERS =>'1');
+			avl_pfn<=(OTHERS =>'0');
+			avl_pfv<='0';
+			avl_pend<=(OTHERS =>0);
+			avl_ready<=(OTHERS =>'0');
+			avl_aqr<=0; avl_aqw<=0; avl_aqn<=0;
+			avl_kqr<=0; avl_kqw<=0; avl_kqn<=0;
+			avl_beat<=0;
 
 		ELSIF rising_edge(avl_clk) THEN
 			----------------------------------
@@ -1700,6 +1740,18 @@ BEGIN
 			avl_read_pulse<=avl_read_sync XOR avl_read_sync2;
 			avl_radrs <=o_adrs; -- <ASYNC>
 			avl_rline <=o_rline; -- <ASYNC>
+			avl_rslot <=o_rslot; -- <ASYNC>
+			avl_rlbase<=o_rlbase; -- <ASYNC>
+			avl_rb    <=o_rb; -- <ASYNC>
+			avl_hburst<=o_hburst; -- <ASYNC>
+			avl_stride<=o_stride; -- <ASYNC>
+			avl_rli   <=o_rli; -- <ASYNC>
+			avl_vsize <=o_ivsize; -- <ASYNC>
+			IF avl_rline='0' THEN
+				avl_rfull<=avl_radrs + avl_o_offset0;
+			ELSE
+				avl_rfull<=avl_radrs + avl_o_offset1;
+			END IF;
 
 			--------------------------------------------
 			avl_o_vs_sync<=o_vsv(0); -- <ASYNC>
@@ -1734,6 +1786,31 @@ BEGIN
 			avl_read_clr <='0';
 
 			avl_rad<=avl_rad_c;
+			inc_v:=false; dec_v:=false; kpush_v:=false; kpop_v:=false;
+			inc_s:=0; dec_s:=0;
+
+			k_v:=avl_c + 1;
+			resync_v:=false;
+			IF to_integer(k_v) MOD N_SLOT /= avl_rslot THEN
+				k_v:=k_v + to_unsigned((avl_rslot - to_integer(k_v) MOD N_SLOT + N_SLOT) MOD N_SLOT,16);
+				resync_v:=true;
+			END IF;
+			d_v:=avl_pfn - k_v;
+			avl_kpre<=k_v;
+			avl_hitpre<=avl_pfv='1' AND NOT resync_v AND d_v>=1 AND d_v<=N_SLOT-1 AND
+				avl_tadr(avl_rslot)=avl_rfull;
+			avl_pfok<=avl_pfv='1' AND avl_fb_ena='1' AND avl_pfn - avl_c<=N_SLOT-2 AND
+				avl_aqn<N_AQ-1;
+			avl_read_sr2<=avl_read_sr;
+			adr_v:=avl_rfull;
+			k_v:=avl_kpre;
+			req_v:=avl_read_sr='1' AND avl_read_sr2='1' AND avl_read_clr='0' AND avl_kqn<4;
+			IF req_v AND avl_hitpre THEN
+				avl_read_clr<='1';
+				avl_c<=k_v;
+				kpush_v:=true;
+				avl_readack<=NOT avl_readack;
+			END IF;
 
 			--------------------------------------------
 			CASE avl_state IS
@@ -1755,9 +1832,50 @@ BEGIN
 								avl_wadrs(N_AW+NB_LA-1 DOWNTO NB_LA) +
 								avl_i_offset1(N_AW+NB_LA-1 DOWNTO NB_LA));
 						END IF;
-					ELSIF avl_read_sr='1' THEN
-						avl_state<=sREAD;
+					ELSIF req_v AND NOT avl_hitpre AND avl_aqn<N_AQ THEN
 						avl_read_clr<='1';
+						avl_c<=k_v;
+						kpush_v:=true;
+						avl_state<=sREAD;
+						avl_iss_adr<=adr_v;
+						avl_iss_dem<='1';
+						inc_v:=true; inc_s:=avl_rslot;
+						avl_tadr(avl_rslot)<=adr_v;
+						avl_pfn<=k_v + 1;
+						avl_pfv<=avl_fb_ena AND to_std_logic(N_SLOT>2);
+						IF avl_rb+1<avl_hburst THEN
+							avl_pfl<=avl_rlbase;
+							avl_pfli<=avl_rli;
+							avl_pfb<=avl_rb+1;
+						ELSIF avl_rli>=avl_vsize THEN
+							avl_pfl<=(OTHERS =>'0');
+							avl_pfli<=0;
+							avl_pfb<=0;
+						ELSE
+							avl_pfl<=avl_rlbase + avl_stride;
+							avl_pfli<=avl_rli+1;
+							avl_pfb<=0;
+						END IF;
+					ELSIF NOT (req_v AND avl_hitpre) AND avl_pfok THEN
+						adr_v:=avl_pfl + to_unsigned(avl_pfb * N_BURST,32) + avl_o_offset0;
+						inc_s:=to_integer(avl_pfn) MOD N_SLOT;
+						inc_v:=true;
+						avl_state<=sREAD;
+						avl_iss_adr<=adr_v;
+						avl_iss_dem<='0';
+						avl_tadr(inc_s)<=adr_v;
+						avl_pfn<=avl_pfn + 1;
+						IF avl_pfb+1<avl_hburst THEN
+							avl_pfb<=avl_pfb+1;
+						ELSIF avl_pfli>=avl_vsize THEN
+							avl_pfl<=(OTHERS =>'0');
+							avl_pfli<=0;
+							avl_pfb<=0;
+						ELSE
+							avl_pfl<=avl_pfl + avl_stride;
+							avl_pfli<=avl_pfli+1;
+							avl_pfb<=0;
+						END IF;
 					END IF;
 
 				WHEN sWRITE =>
@@ -1770,18 +1888,15 @@ BEGIN
 					END IF;
 
 				WHEN sREAD =>
-					IF avl_rline='0' THEN
-						adr_v:=avl_radrs + avl_o_offset0;
-					ELSE
-						adr_v:=avl_radrs + avl_o_offset1;
-					END IF;
-					avl_address<=std_logic_vector(adr_v(N_AW+NB_LA-1 DOWNTO NB_LA));
+					avl_address<=std_logic_vector(avl_iss_adr(N_AW+NB_LA-1 DOWNTO NB_LA));
 
 					avl_read_i<='1';
 					IF avl_read_i='1' AND avl_waitrequest='0' THEN
 						avl_state<=sIDLE;
 						avl_read_i<='0';
-						avl_readack<=NOT avl_readack;
+						IF avl_iss_dem='1' THEN
+							avl_readack<=NOT avl_readack;
+						END IF;
 					END IF;
 			END CASE;
 
@@ -1790,14 +1905,53 @@ BEGIN
 			avl_wr<='0';
 			IF avl_readdatavalid='1' THEN
 				avl_wr<='1';
-				avl_wad<=(avl_wad+1) MOD (2*BLEN);
-				IF (avl_wad MOD BLEN)=BLEN-2 THEN
-					avl_readdataack<=NOT avl_readdataack;
+				avl_wad<=avl_aq(avl_aqr) * BLEN + avl_beat;
+				IF avl_beat=BLEN-1 THEN
+					avl_beat<=0;
+					avl_aqr<=(avl_aqr+1) MOD N_AQ;
+					dec_v:=true; dec_s:=avl_aq(avl_aqr);
+				ELSE
+					avl_beat<=avl_beat+1;
 				END IF;
 			END IF;
 
-			IF avl_o_vs_sync='0' AND avl_o_vs='1' THEN
-				avl_wad<=2*BLEN-1;
+			IF inc_v THEN
+				avl_aq(avl_aqw)<=inc_s;
+				avl_aqw<=(avl_aqw+1) MOD N_AQ;
+			END IF;
+			IF inc_v AND dec_v AND inc_s=dec_s THEN
+				avl_ready(inc_s)<='0';
+			ELSE
+				IF inc_v THEN
+					avl_pend(inc_s)<=avl_pend(inc_s)+1;
+					avl_ready(inc_s)<='0';
+				END IF;
+				IF dec_v THEN
+					avl_pend(dec_s)<=avl_pend(dec_s)-1;
+					IF avl_pend(dec_s)=1 THEN
+						avl_ready(dec_s)<='1';
+					END IF;
+				END IF;
+			END IF;
+			IF inc_v AND NOT dec_v THEN
+				avl_aqn<=avl_aqn+1;
+			ELSIF dec_v AND NOT inc_v THEN
+				avl_aqn<=avl_aqn-1;
+			END IF;
+
+			IF avl_kqn>0 AND avl_ready(avl_kq(avl_kqr))='1' THEN
+				avl_readdataack<=NOT avl_readdataack;
+				avl_kqr<=(avl_kqr+1) MOD 4;
+				kpop_v:=true;
+			END IF;
+			IF kpush_v THEN
+				avl_kq(avl_kqw)<=avl_rslot;
+				avl_kqw<=(avl_kqw+1) MOD 4;
+			END IF;
+			IF kpush_v AND NOT kpop_v THEN
+				avl_kqn<=avl_kqn+1;
+			ELSIF kpop_v AND NOT kpush_v THEN
+				avl_kqn<=avl_kqn-1;
 			END IF;
 
 			--------------------------------------------
@@ -1814,7 +1968,7 @@ BEGIN
 					WHEN avl_write_i='1' AND avl_waitrequest='0' ELSE avl_rad;
 
 	-----------------------------------------------------------------------------
-	-- DPRAM Output. Double buffer for RAM bursts.
+	-- DPRAM Output
 	PROCESS (avl_clk) IS
 	BEGIN
 		IF rising_edge(avl_clk) THEN
@@ -1866,7 +2020,8 @@ BEGIN
 	-----------------------------------------------------------------------------
 	Scalaire:PROCESS (o_clk,o_reset_na) IS
 		VARIABLE lev_inc_v,lev_dec_v : std_logic;
-		VARIABLE prim_v,last_v,bib_v : std_logic;
+		VARIABLE prim_v,last_v : std_logic;
+		VARIABLE slot_v : natural RANGE 0 TO N_SLOT-1;
 		VARIABLE shift_v : unsigned(0 TO N_DW+15);
 		VARIABLE hpix_v : type_pix;
 		VARIABLE hcarry_v,vcarry_v : boolean;
@@ -2043,7 +2198,6 @@ BEGIN
 			IF o_hsv(0)='1' AND o_hsv(1)='0' THEN
 				IF o_vcpt_pre3=o_vmin THEN
 					o_fload<=2;
-					o_bibu<='0';
 				END IF;
 				o_hsp<='1';
 			END IF;
@@ -2120,11 +2274,12 @@ BEGIN
 						lev_inc_v:='1';
 						o_read_pre<=NOT o_read_pre;
 						o_state <=sWAITREAD;
-						o_bibu<=NOT o_bibu;
+						o_slotu<=(o_slotu+1) MOD N_SLOT;
+						o_rslot<=o_slotu;
 					END IF;
 					prim_v:=to_std_logic(o_hbcpt=0);
 					last_v:=to_std_logic(o_hbcpt=o_hburst-1);
-					bib_v :=o_bibu;
+					slot_v:=o_slotu;
 					off_v :=pixoffset(o_adrs + o_fb_base(NB_LA-1 DOWNTO 0),o_fb_format);
 					IF o_fb_ena='0' THEN
 						off_v:=0;
@@ -2174,14 +2329,21 @@ BEGIN
 			IF o_adrsa='1' THEN
 				IF o_fload=2 THEN
 					o_adrs<=to_unsigned(o_hbcpt * N_BURST,32);
+					o_rlbase<=(OTHERS =>'0');
+					o_rli<=0;
 					o_alt<="1111";
 				ELSIF o_fload=1 THEN
 					o_adrs<=to_unsigned(o_hbcpt * N_BURST,32) + o_stride;
+					o_rlbase<=resize(o_stride,32);
+					o_rli<=1;
 					o_alt<="0100";
 				ELSE
 					o_adrs<=to_unsigned(o_adrs_pre + (o_hbcpt * N_BURST),32);
+					o_rlbase<=to_unsigned(o_adrs_pre,32);
+					o_rli<=to_integer(o_vacpt);
 					o_alt<=altx(o_vacptl + 1);
 				END IF;
+				o_rb<=o_hbcpt;
 			END IF;
 
 			------------------------------------------------------
@@ -2215,18 +2377,14 @@ BEGIN
 						o_last<='0';
 					END IF;
 
-					IF o_bibv(0)='0' THEN
-						o_ad<=0;
-					ELSE
-						o_ad<=BLEN;
-					END IF;
+					o_ad<=o_slotv(0) * BLEN;
 
 				WHEN sSHIFT =>
 					o_hacpt<=o_hacpt+1;
 					o_sh<='1';
 					o_acpt<=(o_acpt+1) MOD 16;
 					IF shift_onext(o_acpt,o_format) THEN
-						o_ad<=(o_ad+1) MOD (2*BLEN);
+						o_ad<=(o_ad+1) MOD (N_SLOT*BLEN);
 					END IF;
 					o_pshift<=o_pshift-1;
 					IF o_pshift=0 THEN
@@ -2268,7 +2426,7 @@ BEGIN
 						o_last2<=o_last1;
 
 						IF shift_onext(o_acpt,o_format) THEN
-							o_ad<=(o_ad+1) MOD (2*BLEN);
+							o_ad<=(o_ad+1) MOD (N_SLOT*BLEN);
 						END IF;
 
 						IF o_adturn='1' AND (shift_onext((o_acpt+1) MOD 16,o_format)) AND
@@ -2347,7 +2505,7 @@ BEGIN
 			IF lev_dec_v='1' THEN
 				o_primv(0 TO 1)<=o_primv(1 TO 2); -- First buffer of line
 				o_lastv(0 TO 1)<=o_lastv(1 TO 2); -- Last buffer of line
-				o_bibv (0 TO 1)<=o_bibv (1 TO 2); -- Double buffer select
+				o_slotv(0 TO 1)<=o_slotv(1 TO 2);
 				o_off  (0 TO 1)<=o_off  (1 TO 2); -- Start offset
 			END IF;
 
@@ -2355,18 +2513,18 @@ BEGIN
 				IF o_readlev=0 OR (o_readlev=1 AND lev_dec_v='1') THEN
 					o_primv(0)<=prim_v;
 					o_lastv(0)<=last_v;
-					o_bibv (0)<=bib_v;
+					o_slotv(0)<=slot_v;
 					o_off  (0)<=off_v;
 				ELSIF (o_readlev=1 AND lev_dec_v='0') OR
 							(o_readlev=2 AND lev_dec_v='1') THEN
 					o_primv(1)<=prim_v;
 					o_lastv(1)<=last_v;
-					o_bibv (1)<=bib_v;
+					o_slotv(1)<=slot_v;
 					o_off  (1)<=off_v;
 				END IF;
 				o_primv(2)<=prim_v;
 				o_lastv(2)<=last_v;
-				o_bibv (2)<=bib_v;
+				o_slotv(2)<=slot_v;
 				o_off  (2)<=off_v;
 			END IF;
 

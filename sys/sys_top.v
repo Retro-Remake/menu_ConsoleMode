@@ -735,6 +735,7 @@ wire         bob_deint;
 		.FRAC(8),
 `ifdef MENU_CORE
 		.N_BURST(2048),
+		.N_SLOT(16),
 `endif
 		.N_DW(128),
 		.N_AW(28)

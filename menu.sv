@@ -70,10 +70,10 @@ localparam CONF_STR = {
 wire forced_scandoubler;
 wire [31:0] status;
 
-// SNAC always enabled, status[9] is the native-FB mode not SNAC
+// status[25]=1 hands the User port to MT32-pi, status[9] is the native-FB mode not SNAC
 wire [15:0] snac_buttons_wire;
 wire        snac_valid;
-wire        snac_enable = 1'b1;
+wire        snac_enable = ~status[25];
 wire [7:0]  snac_debug_byte1;
 wire [7:0]  snac_debug_byte2;
 wire [3:0]  snac_debug_state;
